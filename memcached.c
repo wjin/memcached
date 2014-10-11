@@ -2,7 +2,7 @@
 /*
  *  memcached - memory caching daemon
  *
- *       http://www.danga.com/memcached/
+ *       http://www.memcached.org/
  *
  *  Copyright 2003 Danga Interactive, Inc.  All rights reserved.
  *
@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
+#include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <ctype.h>
@@ -77,6 +78,7 @@ static void conn_set_state(conn *c, enum conn_states state);
 static void stats_init(void);
 static void server_stats(ADD_STAT add_stats, conn *c);
 static void process_stat_settings(ADD_STAT add_stats, void *c);
+static void conn_to_str(const conn *c, char *buf);
 
 
 /* defaults */
@@ -102,12 +104,14 @@ static void conn_free(conn *c);
 struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
+conn **conns;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
 /** file scope variables **/
 static conn *listen_conn = NULL;
+static int max_fds;
 static struct event_base *main_base;
 
 enum transmit_result {
@@ -178,12 +182,13 @@ static void stats_init(void) {
     stats.slabs_moved = 0;
     stats.accepting_conns = true; /* assuming we start in this state. */
     stats.slab_reassign_running = false;
+    stats.lru_crawler_running = false;
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
        like 'settings.oldest_live' which act as booleans as well as
        values are now false in boolean context... */
-    process_started = time(0) - 2;
+    process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;
     stats_prefix_init();
 }
 
@@ -225,6 +230,9 @@ static void settings_init(void) {
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
     settings.maxconns_fast = false;
+    settings.lru_crawler = false;
+    settings.lru_crawler_sleep = 100;
+    settings.lru_crawler_tocrawl = 0;
     settings.hashpower_init = 0;
     settings.slab_reassign = false;
     settings.slab_automove = 0;
@@ -264,7 +272,7 @@ static int add_msghdr(conn *c)
 
     msg->msg_iov = &c->iov[c->iovused];
 
-    if (c->request_addr_size > 0) {
+    if (IS_UDP(c->transport) && c->request_addr_size > 0) {
         msg->msg_name = &c->request_addr;
         msg->msg_namelen = c->request_addr_size;
     }
@@ -280,66 +288,41 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
+extern pthread_mutex_t conn_lock;
 
 /*
- * Free list management for connections.
+ * Initializes the connections array. We don't actually allocate connection
+ * structures until they're needed, so as to avoid wasting memory when the
+ * maximum connection count is much higher than the actual number of
+ * connections.
+ *
+ * This does end up wasting a few pointers' worth of memory for FDs that are
+ * used for things other than connections, but that's worth it in exchange for
+ * being able to directly index the conns array by FD.
  */
-
-static conn **freeconns;
-static int freetotal;
-static int freecurr;
-/* Lock for connection freelist */
-static pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
-
-
 static void conn_init(void) {
-    freetotal = 200;
-    freecurr = 0;
-    if ((freeconns = calloc(freetotal, sizeof(conn *))) == NULL) {
+    /* We're unlikely to see an FD much higher than maxconns. */
+    int next_fd = dup(1);
+    int headroom = 10;      /* account for extra unexpected open FDs */
+    struct rlimit rl;
+
+    max_fds = settings.maxconns + headroom + next_fd;
+
+    /* But if possible, get the actual highest FD we can possibly ever see. */
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        max_fds = rl.rlim_max;
+    } else {
+        fprintf(stderr, "Failed to query maximum file descriptor; "
+                        "falling back to maxconns\n");
+    }
+
+    close(next_fd);
+
+    if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
+        /* This is unrecoverable so bail out early. */
+        exit(1);
     }
-    return;
-}
-
-/*
- * Returns a connection from the freelist, if any.
- */
-conn *conn_from_freelist() {
-    conn *c;
-
-    pthread_mutex_lock(&conn_lock);
-    if (freecurr > 0) {
-        c = freeconns[--freecurr];
-    } else {
-        c = NULL;
-    }
-    pthread_mutex_unlock(&conn_lock);
-
-    return c;
-}
-
-/*
- * Adds a connection to the freelist. 0 = success.
- */
-bool conn_add_to_freelist(conn *c) {
-    bool ret = true;
-    pthread_mutex_lock(&conn_lock);
-    if (freecurr < freetotal) {
-        freeconns[freecurr++] = c;
-        ret = false;
-    } else {
-        /* try to enlarge free connections array */
-        size_t newsize = freetotal * 2;
-        conn **new_freeconns = realloc(freeconns, sizeof(conn *) * newsize);
-        if (new_freeconns) {
-            freetotal = newsize;
-            freeconns = new_freeconns;
-            freeconns[freecurr++] = c;
-            ret = false;
-        }
-    }
-    pthread_mutex_unlock(&conn_lock);
-    return ret;
 }
 
 static const char *prot_text(enum protocol prot) {
@@ -362,7 +345,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base) {
-    conn *c = conn_from_freelist();
+    conn *c;
+
+    assert(sfd >= 0 && sfd < max_fds);
+    c = conns[sfd];
 
     if (NULL == c) {
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
@@ -409,6 +395,9 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         STATS_LOCK();
         stats.conn_structs++;
         STATS_UNLOCK();
+
+        c->sfd = sfd;
+        conns[sfd] = c;
     }
 
     c->transport = transport;
@@ -421,6 +410,14 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->request_addr_size = sizeof(c->request_addr);
     } else {
         c->request_addr_size = 0;
+    }
+
+    if (transport == tcp_transport && init_state == conn_new_cmd) {
+        if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
+                        &c->request_addr_size)) {
+            perror("getpeername");
+            memset(&c->request_addr, 0, sizeof(c->request_addr));
+        }
     }
 
     if (settings.verbose > 1) {
@@ -443,7 +440,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    c->sfd = sfd;
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
@@ -471,9 +467,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->ev_flags = event_flags;
 
     if (event_add(&c->event, 0) == -1) {
-        if (conn_add_to_freelist(c)) {
-            conn_free(c);
-        }
         perror("event_add");
         return NULL;
     }
@@ -540,7 +533,11 @@ static void conn_cleanup(conn *c) {
  */
 void conn_free(conn *c) {
     if (c) {
+        assert(c != NULL);
+        assert(c->sfd >= 0 && c->sfd < max_fds);
+
         MEMCACHED_CONN_DESTROY(c);
+        conns[c->sfd] = NULL;
         if (c->hdrbuf)
             free(c->hdrbuf);
         if (c->msglist)
@@ -568,17 +565,15 @@ static void conn_close(conn *c) {
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
+    conn_cleanup(c);
+
     MEMCACHED_CONN_RELEASE(c->sfd);
+    conn_set_state(c, conn_closed);
     close(c->sfd);
+
     pthread_mutex_lock(&conn_lock);
     allow_new_conns = true;
     pthread_mutex_unlock(&conn_lock);
-    conn_cleanup(c);
-
-    /* if the connection has big buffers, just free it */
-    if (c->rsize > READ_BUFFER_HIGHWAT || conn_add_to_freelist(c)) {
-        conn_free(c);
-    }
 
     STATS_LOCK();
     stats.curr_conns--;
@@ -658,7 +653,8 @@ static const char *state_text(enum conn_states state) {
                                        "conn_nread",
                                        "conn_swallow",
                                        "conn_closing",
-                                       "conn_mwrite" };
+                                       "conn_mwrite",
+                                       "conn_closed" };
     return statenames[state];
 }
 
@@ -2566,7 +2562,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     STATS_LOCK();
 
     APPEND_STAT("pid", "%lu", (long)pid);
-    APPEND_STAT("uptime", "%u", now);
+    APPEND_STAT("uptime", "%u", now - ITEM_UPDATE_INTERVAL);
     APPEND_STAT("time", "%ld", now + (long)process_started);
     APPEND_STAT("version", "%s", VERSION);
     APPEND_STAT("libevent", "%s", event_get_version());
@@ -2621,6 +2617,9 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("slab_reassign_running", "%u", stats.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }
+    if (settings.lru_crawler) {
+        APPEND_STAT("lru_crawler_running", "%u", stats.lru_crawler_running);
+    }
     APPEND_STAT("malloc_fails", "%llu",
                 (unsigned long long)stats.malloc_fails);
     STATS_UNLOCK();
@@ -2657,8 +2656,119 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
     APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
     APPEND_STAT("slab_automove", "%d", settings.slab_automove);
+    APPEND_STAT("lru_crawler", "%s", settings.lru_crawler ? "yes" : "no");
+    APPEND_STAT("lru_crawler_sleep", "%d", settings.lru_crawler_sleep);
+    APPEND_STAT("lru_crawler_tocrawl", "%lu", (unsigned long)settings.lru_crawler_tocrawl);
     APPEND_STAT("tail_repair_time", "%d", settings.tail_repair_time);
     APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
+    APPEND_STAT("hash_algorithm", "%s", settings.hash_algorithm);
+}
+
+static void conn_to_str(const conn *c, char *buf) {
+    char addr_text[MAXPATHLEN];
+
+    if (!c) {
+        strcpy(buf, "<null>");
+    } else if (c->state == conn_closed) {
+        strcpy(buf, "<closed>");
+    } else {
+        const char *protoname = "?";
+        struct sockaddr_in6 local_addr;
+        struct sockaddr *addr = (void *)&c->request_addr;
+        int af;
+        unsigned short port = 0;
+
+        /* For listen ports and idle UDP ports, show listen address */
+        if (c->state == conn_listening ||
+                (IS_UDP(c->transport) &&
+                 c->state == conn_read)) {
+            socklen_t local_addr_len = sizeof(local_addr);
+
+            if (getsockname(c->sfd,
+                        (struct sockaddr *)&local_addr,
+                        &local_addr_len) == 0) {
+                addr = (struct sockaddr *)&local_addr;
+            }
+        }
+
+        af = addr->sa_family;
+        addr_text[0] = '\0';
+
+        switch (af) {
+            case AF_INET:
+                (void) inet_ntop(af,
+                        &((struct sockaddr_in *)addr)->sin_addr,
+                        addr_text,
+                        sizeof(addr_text) - 1);
+                port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+                protoname = IS_UDP(c->transport) ? "udp" : "tcp";
+                break;
+
+            case AF_INET6:
+                addr_text[0] = '[';
+                addr_text[1] = '\0';
+                if (inet_ntop(af,
+                        &((struct sockaddr_in6 *)addr)->sin6_addr,
+                        addr_text + 1,
+                        sizeof(addr_text) - 2)) {
+                    strcat(addr_text, "]");
+                }
+                port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+                protoname = IS_UDP(c->transport) ? "udp6" : "tcp6";
+                break;
+
+            case AF_UNIX:
+                strncpy(addr_text,
+                        ((struct sockaddr_un *)addr)->sun_path,
+                        sizeof(addr_text) - 1);
+                addr_text[sizeof(addr_text)-1] = '\0';
+                protoname = "unix";
+                break;
+        }
+
+        if (strlen(addr_text) < 2) {
+            /* Most likely this is a connected UNIX-domain client which
+             * has no peer socket address, but there's no portable way
+             * to tell for sure.
+             */
+            sprintf(addr_text, "<AF %d>", af);
+        }
+
+        if (port) {
+            sprintf(buf, "%s:%s:%u", protoname, addr_text, port);
+        } else {
+            sprintf(buf, "%s:%s", protoname, addr_text);
+        }
+    }
+}
+
+static void process_stats_conns(ADD_STAT add_stats, void *c) {
+    int i;
+    char key_str[STAT_KEY_LEN];
+    char val_str[STAT_VAL_LEN];
+    char conn_name[MAXPATHLEN + sizeof("unix:")];
+    int klen = 0, vlen = 0;
+
+    assert(add_stats);
+
+    for (i = 0; i < max_fds; i++) {
+        if (conns[i]) {
+            /* This is safe to do unlocked because conns are never freed; the
+             * worst that'll happen will be a minor inconsistency in the
+             * output -- not worth the complexity of the locking that'd be
+             * required to prevent it.
+             */
+            if (conns[i]->state != conn_closed) {
+                conn_to_str(conns[i], conn_name);
+
+                APPEND_NUM_STAT(i, "addr", "%s", conn_name);
+                APPEND_NUM_STAT(i, "state", "%s",
+                        state_text(conns[i]->state));
+                APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
+                        current_time - conns[i]->last_cmd_time);
+            }
+        }
+    }
 }
 
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
@@ -2710,6 +2820,8 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         buf = item_cachedump(id, limit, &bytes);
         write_and_free(c, buf, bytes);
         return ;
+    } else if (strcmp(subcommand, "conns") == 0) {
+        process_stats_conns(&append_stats, c);
     } else {
         /* getting here means that the subcommand is either engine specific or
            is invalid. query the engine and see. */
@@ -3453,6 +3565,69 @@ static void process_command(conn *c, char *command) {
         } else {
             out_string(c, "ERROR");
         }
+    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
+        if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
+            int rv;
+            if (settings.lru_crawler == false) {
+                out_string(c, "CLIENT_ERROR lru crawler disabled");
+                return;
+            }
+
+            rv = lru_crawler_crawl(tokens[2].value);
+            switch(rv) {
+            case CRAWLER_OK:
+                out_string(c, "OK");
+                break;
+            case CRAWLER_RUNNING:
+                out_string(c, "BUSY currently processing crawler request");
+                break;
+            case CRAWLER_BADCLASS:
+                out_string(c, "BADCLASS invalid class id");
+                break;
+            }
+            return;
+        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
+            uint32_t tocrawl;
+             if (!safe_strtoul(tokens[2].value, &tocrawl)) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            settings.lru_crawler_tocrawl = tocrawl;
+            out_string(c, "OK");
+            return;
+        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
+            uint32_t tosleep;
+            if (!safe_strtoul(tokens[2].value, &tosleep)) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            if (tosleep > 1000000) {
+                out_string(c, "CLIENT_ERROR sleep must be one second or less");
+                return;
+            }
+            settings.lru_crawler_sleep = tosleep;
+            out_string(c, "OK");
+            return;
+        } else if (ntokens == 3) {
+            if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
+                if (start_item_crawler_thread() == 0) {
+                    out_string(c, "OK");
+                } else {
+                    out_string(c, "ERROR failed to start lru crawler thread");
+                }
+            } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
+                if (stop_item_crawler_thread() == 0) {
+                    out_string(c, "OK");
+                } else {
+                    out_string(c, "ERROR failed to stop lru crawler thread");
+                }
+            } else {
+                out_string(c, "ERROR");
+            }
+            return;
+        } else {
+            out_string(c, "ERROR");
+        }
     } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
         process_verbosity_command(c, tokens, ntokens);
     } else {
@@ -3584,6 +3759,7 @@ static int try_read_command(conn *c) {
 
         assert(cont <= (c->rcurr + c->rbytes));
 
+        c->last_cmd_time = current_time;
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
@@ -4144,6 +4320,11 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
 
+        case conn_closed:
+            /* This only happens if dormando is an idiot. */
+            abort();
+            break;
+
         case conn_max_state:
             assert(false);
             break;
@@ -4351,8 +4532,17 @@ static int server_socket(const char *interface,
             int c;
 
             for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* this is guaranteed to hit all threads because we round-robin */
-                dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
+                /* Allocate one UDP file descriptor per worker thread;
+                 * this allows "stats conns" to separately list multiple
+                 * parallel UDP requests in progress.
+                 *
+                 * The dispatch code round-robins new connection requests
+                 * among threads, so this is guaranteed to assign one
+                 * FD to each thread.
+                 */
+                int per_thread_fd = c ? dup(sfd) : sfd;
+                dispatch_conn_new(per_thread_fd, conn_read,
+                                  EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport);
             }
         } else {
@@ -4522,7 +4712,7 @@ static void clock_handler(const int fd, const short which, void *arg) {
         struct timespec ts;
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
             monotonic = true;
-            monotonic_start = ts.tv_sec - 2;
+            monotonic_start = ts.tv_sec - ITEM_UPDATE_INTERVAL - 2;
         }
 #endif
     }
@@ -4613,6 +4803,13 @@ static void usage(void) {
            "              - tail_repair_time: Time in seconds that indicates how long to wait before\n"
            "                forcefully taking over the LRU tail item whose refcount has leaked.\n"
            "                The default is 3 hours.\n"
+           "              - hash_algorithm: The hash table algorithm\n"
+           "                default is jenkins hash. options: jenkins, murmur3\n"
+           "              - lru_crawler: Enable LRU Crawler background thread\n"
+           "              - lru_crawler_sleep: Microseconds to sleep between items\n"
+           "                default is 100.\n"
+           "              - lru_crawler_tocrawl: Max items to crawl per slab per run\n"
+           "                default is 0 (unlimited)\n"
            );
     return;
 }
@@ -4829,6 +5026,7 @@ int main (int argc, char **argv) {
     char *pid_file = NULL;
     struct passwd *pw;
     struct rlimit rlim;
+    char *buf;
     char unit = '\0';
     int size_max = 0;
     int retval = EXIT_SUCCESS;
@@ -4840,6 +5038,8 @@ int main (int argc, char **argv) {
     bool protocol_specified = false;
     bool tcp_specified = false;
     bool udp_specified = false;
+    enum hashfunc_type hash_type = JENKINS_HASH;
+    uint32_t tocrawl;
 
     char *subopts;
     char *subopts_value;
@@ -4848,7 +5048,11 @@ int main (int argc, char **argv) {
         HASHPOWER_INIT,
         SLAB_REASSIGN,
         SLAB_AUTOMOVE,
-        TAIL_REPAIR_TIME
+        TAIL_REPAIR_TIME,
+        HASH_ALGORITHM,
+        LRU_CRAWLER,
+        LRU_CRAWLER_SLEEP,
+        LRU_CRAWLER_TOCRAWL
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -4856,6 +5060,10 @@ int main (int argc, char **argv) {
         [SLAB_REASSIGN] = "slab_reassign",
         [SLAB_AUTOMOVE] = "slab_automove",
         [TAIL_REPAIR_TIME] = "tail_repair_time",
+        [HASH_ALGORITHM] = "hash_algorithm",
+        [LRU_CRAWLER] = "lru_crawler",
+        [LRU_CRAWLER_SLEEP] = "lru_crawler_sleep",
+        [LRU_CRAWLER_TOCRAWL] = "lru_crawler_tocrawl",
         NULL
     };
 
@@ -5050,18 +5258,19 @@ int main (int argc, char **argv) {
             }
             break;
         case 'I':
-            unit = optarg[strlen(optarg)-1];
+            buf = strdup(optarg);
+            unit = buf[strlen(buf)-1];
             if (unit == 'k' || unit == 'm' ||
                 unit == 'K' || unit == 'M') {
-                optarg[strlen(optarg)-1] = '\0';
-                size_max = atoi(optarg);
+                buf[strlen(buf)-1] = '\0';
+                size_max = atoi(buf);
                 if (unit == 'k' || unit == 'K')
                     size_max *= 1024;
                 if (unit == 'm' || unit == 'M')
                     size_max *= 1024 * 1024;
                 settings.item_size_max = size_max;
             } else {
-                settings.item_size_max = atoi(optarg);
+                settings.item_size_max = atoi(buf);
             }
             if (settings.item_size_max < 1024) {
                 fprintf(stderr, "Item max size cannot be less than 1024 bytes.\n");
@@ -5078,6 +5287,7 @@ int main (int argc, char **argv) {
                     " and will decrease your memory efficiency.\n"
                 );
             }
+            free(buf);
             break;
         case 'S': /* set Sasl authentication to true. Default is false */
 #ifndef ENABLE_SASL
@@ -5140,6 +5350,40 @@ int main (int argc, char **argv) {
                     return 1;
                 }
                 break;
+            case HASH_ALGORITHM:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing hash_algorithm argument\n");
+                    return 1;
+                };
+                if (strcmp(subopts_value, "jenkins") == 0) {
+                    hash_type = JENKINS_HASH;
+                } else if (strcmp(subopts_value, "murmur3") == 0) {
+                    hash_type = MURMUR3_HASH;
+                } else {
+                    fprintf(stderr, "Unknown hash_algorithm option (jenkins, murmur3)\n");
+                    return 1;
+                }
+                break;
+            case LRU_CRAWLER:
+                if (start_item_crawler_thread() != 0) {
+                    fprintf(stderr, "Failed to enable LRU crawler thread\n");
+                    return 1;
+                }
+                break;
+            case LRU_CRAWLER_SLEEP:
+                settings.lru_crawler_sleep = atoi(subopts_value);
+                if (settings.lru_crawler_sleep > 1000000 || settings.lru_crawler_sleep < 0) {
+                    fprintf(stderr, "LRU crawler sleep must be between 0 and 1 second\n");
+                    return 1;
+                }
+                break;
+            case LRU_CRAWLER_TOCRAWL:
+                if (!safe_strtoul(subopts_value, &tocrawl)) {
+                    fprintf(stderr, "lru_crawler_tocrawl takes a numeric 32bit value\n");
+                    return 1;
+                }
+                settings.lru_crawler_tocrawl = tocrawl;
+                break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
                 return 1;
@@ -5151,6 +5395,11 @@ int main (int argc, char **argv) {
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
         }
+    }
+
+    if (hash_init(hash_type) != 0) {
+        fprintf(stderr, "Failed to initialize hash_algorithm!\n");
+        exit(EX_USAGE);
     }
 
     /*
@@ -5297,6 +5546,9 @@ int main (int argc, char **argv) {
         start_slab_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
     }
+
+    /* Run regardless of initializing it later */
+    init_lru_crawler();
 
     /* initialise clock event */
     clock_handler(0, 0, 0);

@@ -63,6 +63,13 @@
 /* Initial power multiplier for the hash table */
 #define HASHPOWER_DEFAULT 16
 
+/*
+ * We only reposition items in the LRU queue if they haven't been repositioned
+ * in this many seconds. That saves us from churning on frequently-accessed
+ * items.
+ */
+#define ITEM_UPDATE_INTERVAL 60
+
 /* unistd.h is here */
 #if HAVE_UNISTD_H
 # include <unistd.h>
@@ -75,8 +82,8 @@
 #define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
 
 /** How long an object can reasonably be assumed to be locked before
-    harvesting it on a low memory condition. */
-#define TAIL_REPAIR_TIME_DEFAULT (1 * 3600)
+    harvesting it on a low memory condition. Default: disabled. */
+#define TAIL_REPAIR_TIME_DEFAULT 0
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
 #define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
@@ -150,6 +157,7 @@ enum conn_states {
     conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
     conn_closing,    /**< closing this connection */
     conn_mwrite,     /**< writing out many items sequentially */
+    conn_closed,     /**< connection is closed */
     conn_max_state   /**< Max state value (used for assertion) */
 };
 
@@ -272,6 +280,7 @@ struct stats {
     uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
+    bool          lru_crawler_running; /* crawl in progress */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -305,12 +314,16 @@ struct settings {
     int item_size_max;        /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
+    bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
     int slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
     bool shutdown_command; /* allow shutdown command */
     int tail_repair_time;   /* LRU tail refcount leak repair time */
     bool flush_enabled;     /* flush_all enabled */
+    char *hash_algorithm;     /* Hash algorithm in use */
+    int lru_crawler_sleep;  /* Microsecond sleep between items */
+    uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
 };
 
 extern struct stats stats;
@@ -353,6 +366,21 @@ typedef struct _stritem {
 } item;
 
 typedef struct {
+    struct _stritem *next;
+    struct _stritem *prev;
+    struct _stritem *h_next;    /* hash chain next */
+    rel_time_t      time;       /* least recent access */
+    rel_time_t      exptime;    /* expire time */
+    int             nbytes;     /* size of data */
+    unsigned short  refcount;
+    uint8_t         nsuffix;    /* length of flags-and-length string */
+    uint8_t         it_flags;   /* ITEM_* above */
+    uint8_t         slabs_clsid;/* which slab class we're in */
+    uint8_t         nkey;       /* key length, w/terminating null and padding */
+    uint32_t        remaining;  /* Max keys to crawl per slab per invocation */
+} crawler;
+
+typedef struct {
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
     struct event notify_event;  /* listen event for notify pipe */
@@ -379,6 +407,7 @@ struct conn {
     bool authenticated;
     enum conn_states  state;
     enum bin_substates substate;
+    rel_time_t last_cmd_time;
     struct event event;
     short  ev_flags;
     short  which;   /** which events were just triggered */
@@ -462,6 +491,8 @@ struct conn {
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
 };
 
+/* array of conn structures, indexed by file descriptor */
+extern conn **conns;
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
